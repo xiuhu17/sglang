@@ -392,6 +392,19 @@ class EagleDraftWorker(BaseDraftWorker):
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
+        # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
+        # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is None:
+                max_context_len = (
+                    self.target_worker.model_runner.attn_backend.max_context_len
+                )
+                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
+            else:
+                # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
+                seq_lens_sum = 0
+
         (
             tree_mask,
             position,
@@ -405,7 +418,7 @@ class EagleDraftWorker(BaseDraftWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum,
+            seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
@@ -473,6 +486,13 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # Set inputs
             forward_batch.input_ids = input_ids
+            # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
+            # argument must be contiguous.
+            if (
+                self.draft_runner.model_config.hf_config.architectures[0]
+                == "Qwen3MoeForCausalLMMTP"
+            ):
+                out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
             spec_info.hidden_states = hidden_states
 
@@ -487,8 +507,19 @@ class EagleDraftWorker(BaseDraftWorker):
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.topk == 1 and not _is_hip:
+                # topk=1 → degenerate single-path tree; `topk_p` is unused
+                # downstream, so skip softmax and just argmax over logits.
+                # Gated to CUDA: on ROCm the argmax tie-break diverges from
+                # the softmax+max path on FP8 logits and corrupts MTP draft
+                # selection (DSV3.2 MTP GSM8K, see #26358).
+                topk_index = torch.argmax(
+                    logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            else:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -660,8 +691,16 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        if self.topk == 1 and not _is_hip:
+            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+            # MTP draft selection on FP8 logits.
+            ret_topk_index = torch.argmax(
+                draft_logits_output.next_token_logits, dim=-1, keepdim=True
+            )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+        else:
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -760,6 +799,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                 )
                 self.adaptive_controller.init_states()
+
+    @property
+    def spec_v2_attn_backends(self) -> tuple:
+        # Every attn backend a spec_v2 forward touches; consumed by
+        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        return (
+            self._target_worker.model_runner.attn_backend,
+            self._draft_worker.draft_attn_backend,
+            self._draft_worker.draft_extend_attn_backend,
+        )
 
     @property
     def target_worker(self):
@@ -1093,6 +1142,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
+            or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
             self._mamba_verify_update(
                 batch, verify_input, accept_lens, accept_index, bs
