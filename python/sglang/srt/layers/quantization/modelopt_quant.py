@@ -2001,6 +2001,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if (
+            self.enable_flashinfer_trtllm_moe
+            and getattr(layer, "_flashinfer_trtllm_fp4_layout", "canonical")
+            == "packed"
+        ):
+            # Already in the TRT-LLM kernel layout (row-shuffled weights,
+            # interleaved scales); re-packing packed data would corrupt it.
+            # A weight update must go through restore_weights_before_loading
+            # first (idempotency guard, mirroring the BF16 TRT-LLM path).
+            return
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
             # the gate/up columns to the gate scale here. Other backends keep the
@@ -2154,12 +2164,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 align_fp4_moe_weights_for_flashinfer_trtllm,
             )
 
+            # Record canonical load-time layouts so a weight update can restore
+            # them (the pack below row-shuffles the weights in place and rebinds
+            # the scales to an interleaved layout).
+            layer._flashinfer_trtllm_fp4_canonical_meta = {
+                name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype)
+                for name in (
+                    "w13_weight",
+                    "w2_weight",
+                    "w13_weight_scale",
+                    "w2_weight_scale",
+                )
+            }
+
             # FlashInfer TRTLLM processing - handles both w13 and w2
             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
+            layer._flashinfer_trtllm_fp4_layout = "packed"
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -2299,6 +2323,48 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     intermediate_size_per_partition=inter_size,  # n
                     hidden_size=hidden_size,
                 )  # k
+
+    def maybe_restore_flashinfer_trtllm_fp4_weights_for_load(
+        self, layer: torch.nn.Module
+    ) -> None:
+        """Restore canonical load-time layouts before a weight update.
+
+        process_weights_after_loading rebinds w13/w2_weight_scale to FlashInfer
+        TRT-LLM's interleaved per-expert layout (and row-shuffles the fp4
+        weights in place, shape-preserved). The FusedMoE weight loader narrows
+        by canonical shapes, so the scales must be reshaped back before
+        canonical checkpoint tensors are copied in. Values are NOT un-shuffled
+        (same convention as the BF16 TRT-LLM restore in unquant.py): the
+        incoming update must overwrite every expert, after which
+        process_weights_after_loading re-packs everything from the fresh
+        canonical bytes. A restore that is NOT followed by a full overwrite of
+        this layer's expert tensors leaves stale shuffled bytes that the next
+        re-pack would treat as canonical and corrupt.
+        """
+        if getattr(layer, "_flashinfer_trtllm_fp4_layout", "canonical") != "packed":
+            return
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            shape, dtype = layer._flashinfer_trtllm_fp4_canonical_meta[name]
+            param = getattr(layer, name)
+            if tuple(param.data.shape) == shape and param.data.dtype == dtype:
+                continue
+            expected_numel = 1
+            for dim in shape:
+                expected_numel *= dim
+            if param.data.numel() != expected_numel:
+                raise NotImplementedError(
+                    f"Cannot restore {name} from packed shape "
+                    f"{tuple(param.data.shape)} to canonical shape {shape}: the "
+                    "TRT-LLM pack padded the intermediate size, which weight "
+                    "update does not support yet."
+                )
+            param.data = param.data.view(dtype).reshape(shape)
+        layer._flashinfer_trtllm_fp4_layout = "canonical"
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Engine weight-update hook (model_loader.loader.restore_weight)."""
+        if self.enable_flashinfer_trtllm_moe:
+            self.maybe_restore_flashinfer_trtllm_fp4_weights_for_load(layer)
 
     @property
     def load_up_proj_weight_first(self) -> bool:

@@ -143,8 +143,8 @@ def select_comparable_weight(quant_method) -> Optional[type]:
     """Map a module's quant_method to its ComparableWeight subclass; None means raw
     (bit-exact) compare. fp8 block quant -> Fp8BlockComparable: load-time ue8m0
     requant yields two valid fp8 encodings, so compare in dequant space with ULP
-    tolerance. nvfp4 -> raise (non-bit-exact, unsupported). int4/mxfp8/mxfp4 and
-    unquantized -> None.
+    tolerance. nvfp4 MoE on flashinfer_trtllm(_routed) -> raw compare (see below);
+    other nvfp4 -> raise (unsupported). int4/mxfp8/mxfp4 and unquantized -> None.
     """
     if (
         isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
@@ -152,7 +152,23 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
-    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
+    if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
+        if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):
+            # FlashInfer TRT-LLM FP4 MoE: process_weights_after_loading
+            # row-shuffles the fp4 weights in place (shape-preserved) and
+            # rebinds the block scales to the interleaved kernel layout;
+            # derived params (g1_alphas*, g2_alphas, *_input_scale_quant,
+            # g1_scale_c, gemm1_clamp_limit) are recomputed from the loaded
+            # tensors. The pack is a deterministic pure function of the
+            # canonical bytes (fresh permute-index cache per call), and both
+            # snapshot and compare observe the packed state, so packed-vs-
+            # packed raw comparison is exact -- the same approach as mxfp8's
+            # swizzled-vs-swizzled compare.
+            return None
+        raise NotImplementedError(
+            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
+        )
+    if isinstance(quant_method, ModelOptFp4LinearMethod):
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
         )
