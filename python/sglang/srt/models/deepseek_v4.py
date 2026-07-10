@@ -531,6 +531,17 @@ class MQALayer(nn.Module):
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
+        if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
+            # Two-step path: norm+rope into a bf16 tensor, then quantize the
+            # nope payload from the bf16-rounded values. The fused kernel
+            # quantizes straight from its fp32 registers, which lands ~4% of
+            # elements in adjacent fp8 bins relative to the trainer-side QAT
+            # (and the DSA-CP path), both of which quantize bf16 tensors.
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            attn_backend.store_cache(
+                layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
+            )
+            return
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
