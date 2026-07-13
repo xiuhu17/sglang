@@ -804,12 +804,6 @@ class FusedMoE(torch.nn.Module):
                 weight_name=weight_name,
             )
 
-        # For the FlashInfer TRT-LLM FP4 path, process_weights_after_loading
-        # rebinds the block scales into an interleaved kernel layout. Restore
-        # canonical shapes before copying update tensors.
-        if isinstance(method, ModelOptNvFp4FusedMoEMethod):
-            method.maybe_restore_flashinfer_trtllm_fp4_weights_for_load(self)
-
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
