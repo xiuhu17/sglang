@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -523,6 +524,9 @@ class DeepseekV4AttnBackend(
 
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
+        )
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
+            model_runner.server_args.dsa_topk_backend
         )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
